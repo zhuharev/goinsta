@@ -20,6 +20,12 @@ type Informations struct {
 type Instagram struct {
 	cookiejar *cookiejar.Jar
 	InstaType
+
+	debug bool
+}
+
+func (i *Instagram) SetDebug(debug bool) {
+	i.debug = debug
 }
 
 type InstaType struct {

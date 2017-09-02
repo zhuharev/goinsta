@@ -277,8 +277,9 @@ type UploadResponse struct {
 // UploadPhotoResponse struct is for uploaded photo response.
 type UploadPhotoResponse struct {
 	StatusResponse
-	Media    MediaItemResponse `json:"media"`
-	UploadID string            `json:"upload_id"`
+	Media            MediaItemResponse `json:"media"`
+	UploadID         string            `json:"upload_id"`
+	ClientSidecardID int64             `json:"client_sidecar_id,omitempty"`
 }
 
 // FriendShipResponse struct is for user friendship_status

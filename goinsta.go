@@ -10,11 +10,13 @@ import (
 	_ "image/png"
 	"io"
 	"io/ioutil"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"net/http/cookiejar"
@@ -611,6 +613,398 @@ func (insta *Instagram) TagFeed(tag string) (response.TagFeedsResponse, error) {
 
 // UploadPhotoFromReader can upload your photo stored in io.Reader with any quality , better to use 87
 func (insta *Instagram) UploadPhotoFromReader(photo io.Reader, photo_caption string, upload_id int64, quality int, filter_type int) (response.UploadPhotoResponse, error) {
+
+	var buf bytes.Buffer
+	rdr := io.TeeReader(photo, &buf)
+
+	res, err := insta.uploadPhotoFromReader(rdr, photo_caption, upload_id, quality, filter_type, false)
+	if err != nil {
+		return response.UploadPhotoResponse{}, err
+	}
+
+	if res.Status != "ok" {
+		return response.UploadPhotoResponse{}, fmt.Errorf("Upload photo error, bad status %s", res.Status)
+	}
+
+	return insta.configureUploadSingePhoto(buf, photo_caption, upload_id, filter_type)
+}
+
+func (insta *Instagram) uploadPhotoFromReader(photo io.Reader, photo_caption string, upload_id int64, quality int, filter_type int, isSidecar bool) (res response.UploadResponse, err error) {
+	md := new(PhotoMetaData)
+	md.Reader = photo
+	return insta.uploadPhotoFromMetadata(md, photo_caption, upload_id, quality, filter_type, isSidecar)
+}
+
+// UploadPhotoFromReader can upload your photo stored in io.Reader with any quality , better to use 87
+func (insta *Instagram) uploadPhotoFromMetadata(md *PhotoMetaData, photo_caption string, upload_id int64, quality int, filter_type int, isSidecar bool) (res response.UploadResponse, err error) {
+	photo_name := fmt.Sprintf("pending_media_%d.jpg", insta.NewUploadID())
+
+	//multipart request body
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	w.WriteField("upload_id", strconv.FormatInt(upload_id, 10))
+	w.WriteField("_uuid", insta.Informations.UUID)
+	w.WriteField("_csrftoken", insta.Informations.Token)
+	w.WriteField("image_compression", `{"lib_name":"jt","lib_version":"1.3.0","quality":"`+strconv.Itoa(quality)+`"}`)
+	if isSidecar {
+		w.WriteField("is_sidecar", "1")
+	}
+
+	fw, err := w.CreateFormFile("photo", photo_name)
+	if err != nil {
+		return
+	}
+
+	var buf bytes.Buffer
+	rdr := io.TeeReader(md.Reader, &buf)
+
+	if _, err = io.Copy(fw, rdr); err != nil {
+		return
+	}
+	if err := w.Close(); err != nil {
+		return res, err
+	}
+
+	//making post request
+	req, err := http.NewRequest("POST", GOINSTA_API_URL+"upload/photo/", &b)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-IG-Capabilities", "3Q4=")
+	req.Header.Set("X-IG-Connection-Type", "WIFI") // cool header :smile:
+	req.Header.Set("Cookie2", "$Version=1")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Content-type", w.FormDataContentType())
+	req.Header.Set("Connection", "close")
+	req.Header.Set("User-Agent", GOINSTA_USER_AGENT)
+
+	client := &http.Client{
+		Jar: insta.cookiejar,
+	}
+	if insta.debug {
+		log.Println("[start upload file]")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return res, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	if insta.debug {
+		log.Printf("[upload data reponse] %s", body)
+	}
+
+	if resp.StatusCode != 200 {
+		err = fmt.Errorf("invalid status code" + resp.Status)
+		return
+	}
+
+	upresponse := response.UploadResponse{}
+	err = json.Unmarshal(body, &upresponse)
+	if err != nil {
+		return
+	}
+
+	// get dimensions
+	width, h, err := getImageDimensionFromReader(&buf)
+	if err != nil {
+		return
+	}
+
+	md.Width = width
+	md.Height = h
+	md.UploadResponse = upresponse
+	md.UploadID = upload_id
+
+	return
+}
+
+func (insta *Instagram) configureUploadSingePhotoFromMetadata(md *PhotoMetaData, photo_caption string, upload_id int64, filter_type int) (response.UploadPhotoResponse, error) {
+	w := md.Width
+	h := md.Height
+
+	config := map[string]interface{}{
+		"media_folder": "Instagram",
+		"source_type":  4,
+		"caption":      photo_caption,
+		"upload_id":    strconv.FormatInt(upload_id, 10),
+		"device":       GOINSTA_DEVICE_SETTINGS,
+		"edits": map[string]interface{}{
+			"crop_original_size": []int{w * 1.0, h * 1.0},
+			"crop_center":        []float32{0.0, 0.0},
+			"crop_zoom":          1.0,
+			"filter_type":        filter_type,
+		},
+		"extra": map[string]interface{}{
+			"source_width":  w,
+			"source_height": h,
+		},
+	}
+	data, err := insta.prepareData(config)
+	if err != nil {
+		return response.UploadPhotoResponse{}, err
+	}
+
+	body, err := insta.sendRequest(&reqOptions{
+		Endpoint: "media/configure/?",
+		PostData: generateSignature(data),
+	})
+	if err != nil {
+		return response.UploadPhotoResponse{}, err
+	}
+
+	uploadresponse := response.UploadPhotoResponse{}
+	err = json.Unmarshal(body, &uploadresponse)
+
+	md.UploadPhotoResponse = uploadresponse
+
+	return uploadresponse, err
+}
+
+func (insta *Instagram) configureUploadSingePhoto(buf bytes.Buffer, photo_caption string, upload_id int64, filter_type int) (response.UploadPhotoResponse, error) {
+	md := &PhotoMetaData{Reader: &buf}
+	w, h, err := getImageDimensionFromReader(md.Reader)
+	if err != nil {
+		return response.UploadPhotoResponse{}, err
+	}
+	md.Width = w
+	md.Height = h
+	return insta.configureUploadSingePhotoFromMetadata(md, photo_caption, upload_id, filter_type)
+}
+
+// UploadPhoto can upload your photo file, stored in filesystem with any quality , better to use 87
+func (insta *Instagram) UploadPhoto(photo_path string, photo_caption string, upload_id int64, quality int, filter_type int) (response.UploadPhotoResponse, error) {
+	f, err := os.Open(photo_path)
+	if err != nil {
+		return response.UploadPhotoResponse{}, err
+	}
+	defer f.Close()
+
+	return insta.UploadPhotoFromReader(f, photo_caption, upload_id, quality, filter_type)
+}
+
+func (insta *Instagram) UploadAlbumFromReader(photoPaths []io.Reader, photo_caption string) (res response.UploadPhotoResponse, err error) {
+	if insta.debug {
+		log.Println("start upload album")
+	}
+
+	var metadatas []*PhotoMetaData
+	for _, rdr := range photoPaths {
+		md := new(PhotoMetaData)
+		md.Reader = rdr
+		md.UploadResponse, err = insta.uploadPhotoFromMetadata(md, photo_caption, insta.NewUploadID(), 87, Filter_Normat, true)
+		if err != nil {
+			return
+		}
+		metadatas = append(metadatas, md)
+	}
+
+	return insta.configureTimelineAlbum(metadatas, Internal{UploadID: insta.NewUploadID()}, photo_caption)
+}
+
+func (insta *Instagram) UploadAlbum(photoPaths []string, photo_capion string) (resp response.UploadPhotoResponse, err error) {
+	var (
+		readers []io.Reader
+	)
+
+	if l := len(photoPaths); l > 10 || l < 2 {
+		err = fmt.Errorf("photo count must be  beetwin 2 and 10")
+		return
+	}
+
+	for _, p := range photoPaths {
+		var file *os.File
+		file, err = os.OpenFile(p, os.O_RDONLY, 0777)
+		if err != nil {
+			return
+		}
+		// file will be closed after calling insta.UploadAlbumFromReader
+		defer file.Close()
+		readers = append(readers, file)
+	}
+
+	return insta.UploadAlbumFromReader(readers, photo_capion)
+}
+
+type Internal struct {
+	UploadID int64
+}
+
+func (insta *Instagram) configureWithRetries(fn func() (resp response.UploadPhotoResponse, err error)) (resp response.UploadPhotoResponse, err error) {
+	for {
+		time.Sleep(1 * time.Second)
+		r, err := fn()
+		if err == nil {
+			return r, nil
+		}
+		log.Println(err.Error())
+		if strings.Contains(err.Error(), "JSON") {
+			continue
+		}
+
+	}
+}
+
+func (insta *Instagram) configureTimelineAlbum(metadatas []*PhotoMetaData, internalMetadata Internal, caption string) (resp response.UploadPhotoResponse, err error) {
+	var endpoint = "media/configure_sidecar/"
+	var albumID = internalMetadata.UploadID
+	var date = time.Now().Format("2006:01:02 15:04:05")
+
+	var childrenMetadata = []map[string]interface{}{}
+
+	for _, media := range metadatas {
+		uploadID := media.UploadID
+		// $photoConfig = [
+		//               'date_time_original'  => $date,
+		//               'scene_type'          => 1,
+		//               'disable_comments'    => false,
+		//               'upload_id'           => $uploadId,
+		//               'source_type'         => 0,
+		//               'scene_capture_type'  => 'standard',
+		//               'date_time_digitized' => $date,
+		//               'geotag_enabled'      => false,
+		//               'camera_position'     => 'back',
+		//               'edits'               => [
+		//                   'filter_strength' => 1,
+		//                   'filter_name'     => 'IGNormalFilter',
+		//               ],
+		//           ];
+		photoConfig := map[string]interface{}{
+			"date_time_original":  date,
+			"scene_type":          1,
+			"disable_comments":    false,
+			"upload_id":           uploadID,
+			"source_type":         0,
+			"scene_capture_type":  "standard",
+			"date_time_digitized": date,
+			"geotag_enabled":      false,
+			"camera_position":     "back",
+			"edits": map[string]interface{}{
+				"filter_strength": 1,
+				"filter_name":     Filter_Normat,
+			},
+		}
+		childrenMetadata = append(childrenMetadata, photoConfig)
+	}
+
+	config := map[string]interface{}{
+		"client_sidecar_id": albumID,
+		"caption":           caption,
+		"children_metadata": childrenMetadata,
+	}
+
+	data, err := insta.prepareData(config)
+	if err != nil {
+		return
+	}
+
+	d, _ := json.Marshal(data)
+	log.Println(string(d))
+
+	body, err := insta.sendRequest(&reqOptions{
+		Endpoint: endpoint,
+		PostData: generateSignature(data),
+	})
+
+	if len(body) == 0 {
+		time.Sleep(500 * time.Millisecond)
+		log.Println("Ressend configure")
+		return insta.configureTimelineAlbum(metadatas, internalMetadata, caption)
+	}
+
+	if insta.debug {
+		log.Printf("[configure album response] %s", body)
+	}
+
+	err = json.Unmarshal(body, &resp)
+	return
+}
+
+type PhotoMetaData struct {
+	UploadID int64
+	Internal Internal
+
+	Reader io.Reader
+
+	Width  int
+	Height int
+
+	UploadResponse      response.UploadResponse
+	UploadPhotoResponse response.UploadPhotoResponse
+}
+
+// func NewPhotoMetaDataFromPath(fpath) *PhotoMetaData {
+//
+// }
+//
+// func NewPhotoMetaDataFromReader(file io.Reader) *PhotoMetaData {
+//
+// }
+
+func uploadPhotoDate(target string, internal Internal) {
+
+}
+
+// NewUploadID return unix nano time
+func (insta *Instagram) NewUploadID() int64 {
+	return time.Now().UnixNano()
+}
+
+// Follow one of instagram users with userID , you can find userID in GetUsername
+func (insta *Instagram) Follow(userID int64) (response.FollowResponse, error) {
+	resp := response.FollowResponse{}
+	data, err := insta.prepareData(map[string]interface{}{
+		"user_id": userID,
+	})
+	if err != nil {
+		return resp, err
+	}
+
+	body, err := insta.sendRequest(&reqOptions{
+		Endpoint: fmt.Sprintf("friendships/create/%d/", userID),
+		PostData: generateSignature(data),
+	})
+	if err != nil {
+		return resp, err
+	}
+
+	err = json.Unmarshal(body, &resp)
+
+	return resp, err
+}
+
+// UnFollow one of instagram users with userID , you can find userID in GetUsername
+func (insta *Instagram) UnFollow(userID int64) (response.UnFollowResponse, error) {
+	resp := response.UnFollowResponse{}
+	data, err := insta.prepareData(map[string]interface{}{
+		"user_id": userID,
+	})
+	if err != nil {
+		return resp, err
+	}
+
+	body, err := insta.sendRequest(&reqOptions{
+		Endpoint: fmt.Sprintf("friendships/destroy/%d/", userID),
+		PostData: generateSignature(data),
+	})
+	if err != nil {
+		return resp, err
+	}
+
+	err = json.Unmarshal(body, &resp)
+
+	return resp, err
+}
+
+// UploadPhotoFromReader can upload your photo stored in io.Reader with any quality , better to use 87
+func (insta *Instagram) LegacyUploadPhotoFromReader(photo io.Reader, photo_caption string, upload_id int64, quality int, filter_type int) (response.UploadPhotoResponse, error) {
 	photo_name := fmt.Sprintf("pending_media_%d.jpg", upload_id)
 
 	//multipart request body
@@ -719,68 +1113,6 @@ func (insta *Instagram) UploadPhotoFromReader(photo io.Reader, photo_caption str
 	} else {
 		return response.UploadPhotoResponse{}, fmt.Errorf(upresponse.Status)
 	}
-}
-
-// UploadPhoto can upload your photo file, stored in filesystem with any quality , better to use 87
-func (insta *Instagram) UploadPhoto(photo_path string, photo_caption string, upload_id int64, quality int, filter_type int) (response.UploadPhotoResponse, error) {
-	f, err := os.Open(photo_path)
-	if err != nil {
-		return response.UploadPhotoResponse{}, err
-	}
-	defer f.Close()
-
-	return insta.UploadPhotoFromReader(f, photo_caption, upload_id, quality, filter_type)
-}
-
-// NewUploadID return unix nano time
-func (insta *Instagram) NewUploadID() int64 {
-	return time.Now().UnixNano()
-}
-
-// Follow one of instagram users with userID , you can find userID in GetUsername
-func (insta *Instagram) Follow(userID int64) (response.FollowResponse, error) {
-	resp := response.FollowResponse{}
-	data, err := insta.prepareData(map[string]interface{}{
-		"user_id": userID,
-	})
-	if err != nil {
-		return resp, err
-	}
-
-	body, err := insta.sendRequest(&reqOptions{
-		Endpoint: fmt.Sprintf("friendships/create/%d/", userID),
-		PostData: generateSignature(data),
-	})
-	if err != nil {
-		return resp, err
-	}
-
-	err = json.Unmarshal(body, &resp)
-
-	return resp, err
-}
-
-// UnFollow one of instagram users with userID , you can find userID in GetUsername
-func (insta *Instagram) UnFollow(userID int64) (response.UnFollowResponse, error) {
-	resp := response.UnFollowResponse{}
-	data, err := insta.prepareData(map[string]interface{}{
-		"user_id": userID,
-	})
-	if err != nil {
-		return resp, err
-	}
-
-	body, err := insta.sendRequest(&reqOptions{
-		Endpoint: fmt.Sprintf("friendships/destroy/%d/", userID),
-		PostData: generateSignature(data),
-	})
-	if err != nil {
-		return resp, err
-	}
-
-	err = json.Unmarshal(body, &resp)
-
-	return resp, err
 }
 
 func (insta *Instagram) Block(userID int64) ([]byte, error) {
